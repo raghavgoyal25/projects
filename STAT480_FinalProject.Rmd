@@ -1,0 +1,717 @@
+---
+title: "STAT 480 Final Project"
+author:
+- Raghav Goyal (raghavg4@illinois.edu)
+- Brian Lim (brianl8@illinois.edu)
+- Daniel Alonso Gonzalez (da39@illinois.edu)
+date: "2024-12-15"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(caret)
+library(glmnet)
+library(pROC)
+library(patchwork)
+```
+
+# Introduction
+
+## Project Definition
+
+In today's urban landscapes, shared mobility solutions like bikeshare programs play a critical role in enhancing transportation efficiency, reducing environmental impact, and fostering healthier lifestyles. The *Chicago Divvy Bikeshare Program*, operated under Lyft and owned by the Chicago Department of Transportation, is a cornerstone of of the city's urban mobility infrastructure, offering an extensive network of stations and bikes to support diverse commuter needs. By analyzing data from this program, we aim to uncover actionable insights that can optimize bikeshare operations and enhance user experiences.
+
+## Project Objectives
+
+This project leverages Divvy data spanning a full 12 months (November 2023 to October 2024), which provides comprehensive information on bike rides, station details, and user demographics. The primary objectives are:     - *Optimizing Station Placements and Bike Availability* 
+    - *Member Retention and Engagement*
+
+# Data Preprocessing, Feature Engineering, and Initial Analysis
+
+```{r}
+nov23 = read.csv("Data/202311-divvy-tripdata.csv")
+dec23 = read.csv("Data/202312-divvy-tripdata.csv")
+jan24 = read.csv("Data/202401-divvy-tripdata.csv")
+feb24 = read.csv("Data/202402-divvy-tripdata.csv")
+mar24 = read.csv("Data/202403-divvy-tripdata.csv")
+apr24 = read.csv("Data/202404-divvy-tripdata.csv")
+may24 = read.csv("Data/202405-divvy-tripdata.csv")
+jun24 = read.csv("Data/202406-divvy-tripdata.csv")
+jul24 = read.csv("Data/202407-divvy-tripdata.csv")
+aug24 = read.csv("Data/202408-divvy-tripdata.csv")
+sep24 = read.csv("Data/202409-divvy-tripdata.csv")
+oct24 = read.csv("Data/202410-divvy-tripdata.csv")
+df = rbind(nov23, dec23, jan24, feb24, mar24, apr24, may24, jun24, jul24,aug24, 
+           sep24, oct24)
+```
+
+We have loaded 12 month historic data ranging from November 2023 to October 2024. Each of these CSV files had over 100,000 observations and had sizes ranging from 25MB to 160MB. After combining, let's get an idea of the overall dataset.
+
+```{r}
+format(object.size(df), units = "auto")
+```
+
+Looks like we are working with just under 2GB worth of data, which is definitely a large dataset in terms of both memory/storage, as well as its potential computational expenses.
+
+The overall dataset has almost 6 million rows across 13 distinct columns. On first glance, we can see that a decent chunk of start and end station names and ids are empty and a few values for ending longitude and ending latitude are missing. To get up and running, we can do some quick cleaning to make the data a bit more manageable. This includes dropping the initial ride id column as it contains no discernible information, changing certain categorical columns into factors, and changing our start and end trip times to a proper datetime format to extract as much information.
+
+```{r}
+# Dropping ID column since no discernible information
+df$ride_id = NULL
+
+# Change ride type to factor
+df$rideable_type = as.factor(df$rideable_type)
+
+# Change start and end from character to datetime format
+df$started_at = ymd_hms(df$started_at)
+df$ended_at = ymd_hms(df$ended_at)
+
+# fetching data with missing end trip coordinates
+missing_coords = df %>%
+  filter(is.na(end_lat) | is.na(end_lng))
+
+# Checking where missing data is from
+missing_coords$month = month(missing_coords$started_at, label = TRUE)
+missing_coords$year = year(missing_coords$started_at)
+table(missing_coords$month, missing_coords$year)
+```
+It seems the 7417 missing values in the ending coordinates are pretty spread out across each month, since this is a fairly negligible amount compared to the near 6 million observations, we can simply drop them. Especially, considering that these coordinates are important pieces of information with no real potential way of imputing. 
+
+```{r}
+df <- df %>%
+  drop_na(end_lat, end_lng)
+```
+
+Let's take a closer look at the empty rows in the start and end station columns. These empty occurrences are spread across the time frame, so it is not the case that 1 or a few months are missing this data.
+
+```{r}
+# Filling with NAs
+df$start_station_name[df$start_station_name == ""] = NA
+df$start_station_id[df$start_station_id == ""] = NA
+df$end_station_name[df$end_station_name == ""] = NA
+df$end_station_id[df$start_station_id == ""] = NA
+
+na_stations <- df %>%
+  filter(is.na(start_station_name) | 
+         is.na(start_station_id) | 
+         is.na(end_station_name) | 
+         is.na(end_station_id))
+```
+
+```{r}
+table(na_stations$rideable_type, na_stations$member_casual)
+```
+We can see that most empty station data are for electric bikes and scooters and this makes sense as only classic bikes need to be operated at Divvy specific docking stations and e-bikes and scooters are eligible to be parked at any public racks for free and other legal public locations for a small cost. Since the values for the classic bike are actually "missing" we will drop these. Also, there are no instances where station id contains information and station name does not or vice-versa and there is no discernible information for station id so we will drop the two corresponding columns for this.
+
+```{r}
+df <- df %>%
+  filter(!(is.na(start_station_name) & rideable_type == "classic_bike"),
+         !(is.na(end_station_name) & rideable_type == "classic_bike"))
+
+df <- df %>%
+  select(-start_station_id, -end_station_id)
+```
+
+For the rest of the station NAs, we can fill them up by using a two-element tuple containing the longitude and latitude of of their start and end trip. Dropping these values would not be advisable as they constitute the majority of total observations containing e-bike and scooter specific data.
+
+```{r}
+df$start_station_name = ifelse(
+  is.na(df$start_station_name),
+  paste0("(", df$start_lat, ", ", df$start_lng, ")"),
+  df$start_station_name
+)
+
+df$end_station_name = ifelse(
+  is.na(df$end_station_name),
+  paste0("(", df$end_lat, ", ", df$end_lng, ")"),
+  df$end_station_name
+)
+
+df$start_station_name = as.factor(df$start_station_name)
+df$end_station_name = as.factor(df$end_station_name)
+```
+
+The data we currently have has the trip start and end time down to the second. By finding the differences between these two columns, we can create a new feature to represent the trip duration in minutes. To ensure data quality we will also filter out "negative" trip durations or overly long times like over 500 minutes long.
+```{r}
+df$trip_duration = as.numeric(difftime(df$ended_at, df$started_at, units = "mins"))
+df <- df %>%
+  filter(trip_duration >= 0 & trip_duration <= 500)
+```
+
+Let's also create a few additional time-based features. These include, extracting the specific months, day, and hours of the rides. We can also create a entirely new feature called part of the day, where we segment mornings, afternoons, evenings, and nights. Below is a quick preview of these new features.
+
+```{r}
+df$month = month(df$started_at, label = TRUE, abbr = TRUE)
+df$day <- wday(df$started_at, label = TRUE, abbr = TRUE)
+df$hour <- hour(df$started_at)
+
+df$part_of_day <- case_when(
+  df$hour >= 5 & df$hour < 12 ~ "Morning",     # 5 AM to 12 PM
+  df$hour >= 12 & df$hour < 17 ~ "Afternoon", # 12 PM to 5 PM
+  df$hour >= 17 & df$hour < 21 ~ "Evening",   # 5 PM to 9 PM
+  TRUE ~ "Night"                              # 9 PM to 5 AM
+)
+df$part_of_day <- as.factor(df$part_of_day)
+
+head(df[, c("started_at", "month", "day", "hour", "part_of_day")])
+```
+
+# Further Exploratory Analysis and Visualization
+
+We have completed a fair amount of data cleaning and feature engineering to this point. Let's now get into the crux of the data and explore further and generate some useful visualizations and potentiall actionable insights.
+
+```{r}
+# Ride volume by month
+ggplot(df, aes(x = month)) +
+  geom_bar(fill = "skyblue") +
+  labs(title = "Figure 1: Monthly Ride Volume", x = "Month", y = "Number of Rides") +
+  theme_minimal()
+```
+In the entire 12-month period we have 5.9 million trips, and we can see that most of these trips occur in the summer months, with some decent amount in the fall and spring as well. It is clear to see that winter trips are not as popular which makes sense due to the harsh conditions we see in Chicago during that time.
+
+```{r}
+# Ride volume by day of the week
+ggplot(df, aes(x = day)) +
+  geom_bar(fill = "lightgreen") +
+  labs(title = "Figure 2: Ride Volume by Day of the Week", x = "Day", y = "Number of Rides") +
+  theme_minimal()
+```
+
+Rides are extremely consistent throughout the week. It may be the case that during the weekdays they are used for peak commute (school, work, etc), while on the weekends they can be used for leisure. 
+
+```{r}
+#Ride volume by hour of the day and part of the day
+ggplot(df, aes(x = hour, fill = part_of_day)) +
+  geom_bar() +
+  labs(
+    title = "Figure 3: Ride Volume by Hour of the Day and Part of the Day",
+    x = "Hour of the Day",
+    y = "Number of Rides",
+    fill = "Part of the Day"
+  ) +
+  scale_fill_manual(
+    values = c("Morning" = "cyan", "Afternoon" = "lightblue", 
+               "Evening" = "royalblue", "Night" = "midnightblue")
+  ) +
+  theme_minimal()
+```
+
+Most rides occur during the late afternoon and early evening portions of the day, from around 3PM to 6PM. This makes sense as this time is also associated with peak commute and is typically considered "pleasant" on off-days around the city. There is still a decent amount of rides throughout the day, although this undertandibly drops significantly during the dead of night.
+
+```{r}
+# Ride patterns by part of the day and user type
+ggplot(df, aes(x = part_of_day, fill = member_casual)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Figure 4: Ride Volume by Part of the Day and User Type", x = "Part of the Day", y = "Number of Rides") +
+  scale_fill_manual(values = c("casual" = "darksalmon", "member" = "limegreen")) +
+  theme_minimal()
+```
+For overall trips, we have around 63% of them being from members and the remaining 37% of them being casual or single-use riders. Pretty much across the board time-wise, we see a consistent trend of member riders being more frequent than casual, however, this difference is less for night rides. Let's check how long these rides typically are.
+
+```{r}
+num_long_trips = df %>%
+  filter(trip_duration > 60) %>%
+  nrow()
+print(num_long_trips)
+```
+
+There are 143 thousand trips that are longer than 1 hour. This means that the vast majority of trips are within the 1-hour time frame, so let's check the distribution of trip length from 0-60 minutes.
+
+```{r}
+# Distribution of trip duration
+ggplot(df, aes(x = trip_duration)) +
+  geom_histogram(bins = 30, fill = "cyan", color = "black") +
+  xlim(0, 60) + # Focus on trips within 1 hour
+  labs(title = "Figure 5: Distribution of Trip Durations", x = "Trip Duration (minutes)", y = "Frequency") +
+  theme_minimal()
+```
+
+In general, most trips are fairly short and run from 2-15 minutes. This is expected as people likely use these vehicles for short, convenient commutes across the city.
+
+```{r}
+# Trip duration by user type
+ggplot(df, aes(x = member_casual, y = trip_duration, fill = member_casual)) +
+  geom_boxplot() +
+  ylim(0, 60) + # Focus on trips within 1 hour
+  labs(title = "Figure 6: Trip Duration by User Type", x = "User Type", y = "Trip Duration (minutes)") +
+  scale_fill_manual(values = c("casual" = "lightblue", "member" = "lightgreen")) +
+  theme_minimal()
+```
+Casual riders are more likely to have longer trips. This may be the case due to pricing. Members do not have to pay an unlocking fee and variable rates are lower, so members are not subject to greater costs upfront to deter them from shorter rides. Single-use riders however, may feel the need to get the most out of their unlocking fee and opt for longer rides.
+
+Classic bikes and electric bikes take up more than 95% of total ride volume, but let's see if there are any differences in trip duration for each ride type.
+
+```{r}
+df %>%
+  group_by(rideable_type) %>%
+  summarize(avg_trip_duration = mean(trip_duration, na.rm = TRUE)) %>%
+  ggplot(aes(x = rideable_type, y = avg_trip_duration, fill = rideable_type)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Figure: 7 Average Trip Duration by Rideable Type",
+    x = "Rideable Type",
+    y = "Average Trip Duration (minutes)"
+  ) +
+  scale_fill_manual(values = c("classic_bike" = "#FFDDC1", "electric_bike" = "#FFC857", "scooter" = "#6A4C93")) +
+  theme_minimal()
+```
+
+It seems trips with classic bikes have longer trip times compared to the e-vehicles. This could be so due to the e-vehicles having higher operational speeds, leading to a smaller duration. Let's now check out what some of the most popular starting and ending docking stations are. 
+
+```{r}
+# Aggregate and find top 5 starting stations for each user type
+top_starting_stations <- df %>%
+  group_by(start_station_name, member_casual) %>%
+  summarize(num_rides = n(), .groups = "drop") %>%
+  arrange(member_casual, desc(num_rides)) %>%
+  group_by(member_casual) %>%
+  slice_max(num_rides, n = 5)  # Get top 5 for each group
+
+
+# Aggregate and find top 5 ending stations for each user type
+top_ending_stations <- df %>%
+  group_by(end_station_name, member_casual) %>%
+  summarize(num_rides = n(), .groups = "drop") %>%
+  arrange(member_casual, desc(num_rides)) %>%
+  group_by(member_casual) %>%
+  slice_max(num_rides, n = 5)  # Get top 5 for each group
+
+# Generate the two plots (reuse your code for the plots)
+# Top 5 Starting Stations
+plot_starting <- ggplot(top_starting_stations, aes(x = reorder(start_station_name, num_rides), y = num_rides, fill = member_casual)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Figure 8: Top 5 Starting Stations by User Type",
+    x = "Starting Station",
+    y = "Number of Rides",
+    fill = "User Type"
+  ) +
+  scale_fill_manual(values = c("casual" = "skyblue", "member" = "lightgreen")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Top 5 Ending Stations
+plot_ending <- ggplot(top_ending_stations, aes(x = reorder(end_station_name, num_rides), y = num_rides, fill = member_casual)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Figure 9: Top 5 Ending Stations by User Type",
+    x = "Ending Station",
+    y = "Number of Rides",
+    fill = "User Type"
+  ) +
+  scale_fill_manual(values = c("casual" = "skyblue", "member" = "lightgreen")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Combine plots in a 2x1 layout
+combined_plot <- plot_starting / plot_ending  # Use '/' to stack vertically
+
+# Display the combined plot
+combined_plot
+```
+
+From figures 8 and 9 above, we can see that a lot of the starting and ending stations are same for both casual riders and members. Most of these are official docking stations like "Streeter Dr & Grand Ave", however there is one very popular general location of (41.89, -87.63) which happens to be in the River North Area where the Courthouse Place is. This is nationally recognised as a historical landmark which may point to its popularity.
+
+# Modeling 
+
+We have been able to gather a lot of useful information and learned more about the data we are dealing with. However, it is time to move into some more advanced analytics and modeling. After all, we aim to optimize station placements and bike availability, as well as understand membership vs casual riders.
+
+## Cluster Analysis
+
+We will first cluster rides based on station location and usage. Given the dataset size, clustering on the entire dataset will be very computationally expensive, so instead, we can create a stratified sample of 5% to ensure stations are still well-represented.
+
+```{r}
+# Create stratified sampling by station and user type
+set.seed(66)
+stratified_sample = df %>%
+  group_by(start_station_name, member_casual) %>%
+  sample_frac(0.05) %>%
+  ungroup()
+```
+
+```{r}
+# Aggregate station data for clustering
+station_data_sample = stratified_sample %>%
+  group_by(start_station_name, start_lat, start_lng) %>%
+  summarize(
+    total_rides = n(),
+    avg_trip_duration = mean(trip_duration, na.rm = TRUE),
+    member_ratio = mean(member_casual == "member"), # Proportion of member rides
+    .groups = "drop"
+  )
+```
+
+```{r}
+# Scale the data for clustering
+station_scaled = scale(station_data_sample[, c("total_rides", "avg_trip_duration", "member_ratio")])
+
+# Apply K-means clustering
+set.seed(66)
+kmeans_result = kmeans(station_scaled, centers = 3, nstart = 25)
+
+# Add cluster labels back to the data
+station_data_sample$cluster = as.factor(kmeans_result$cluster)
+```
+
+```{r}
+# Visualize clustering results
+ggplot(station_data_sample, aes(x = start_lng, y = start_lat, color = cluster, size = total_rides)) +
+  geom_point(alpha = 0.5) +
+  labs(
+    title = "Figure 10: Clustered Stations Based on Usage Patterns",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Cluster",
+    size = "Total Rides"
+  ) +
+  theme_minimal()
+```
+
+In Figure 10 above, we have clustered stations based on usage patterns like total rides, average trip duration, and member ratio. There is one cluster that covers stations more widespread geographically, covering areas both in the periphery and less dense areas. Another cluster dominates the plot with a heavy concentration in mid-density areas. The last cluster is highly concentrated in downtown Chicago and represents high-demand stations.
+
+The high-demand stations in concentrated cluster are critical for operational efficiency and user satisfaction. It would make sense to increase bike availability during peak hours and to meet demand and other potential redistribution depending on temporal patterns, considering these are starting stations. We can focus on the demand differences between Cluster 3 and 1, and keep Cluster 2 as is since it acts like an intermediary between the two.
+
+```{r}
+# Filter data for Cluster 3 (High-Demand Stations)
+cluster_3_stations <- station_data_sample %>%
+  filter(cluster == 3) %>%  # Select clusters 2 and 3
+  pull(start_station_name)
+```
+
+```{r}
+# Aggregate rides by hourly timestamps
+hourly_rides_high = df %>%
+  filter(start_station_name %in% cluster_3_stations) %>%
+  mutate(timestamp_hour = floor_date(ymd_hms(started_at), unit = "hour")) %>%
+  group_by(timestamp_hour) %>%
+  summarize(total_rides_high = n(), .groups = "drop")
+
+hourly_rides_high = hourly_rides_high %>%
+  filter(!is.na(timestamp_hour))
+```
+
+```{r}
+# Filter for Cluster 1 (Low-Demand Stations)
+cluster_1_stations = station_data_sample %>%
+  filter(cluster == 1) %>%
+  pull(start_station_name)
+```
+
+```{r}
+# Aggregate hourly rides for Cluster 1
+hourly_rides_low = df %>%
+  filter(start_station_name %in% cluster_1_stations) %>%
+  mutate(timestamp_hour = floor_date(ymd_hms(started_at), unit = "hour")) %>%
+  group_by(timestamp_hour) %>%
+  summarize(total_rides_low = n(), .groups = "drop")
+
+hourly_rides_low = hourly_rides_low %>%
+  filter(!is.na(timestamp_hour))
+```
+
+```{r}
+# Create a continuous hourly timestamp range
+start_time = min(c(min(hourly_rides_high$timestamp_hour), min(hourly_rides_low$timestamp_hour)))
+end_time = max(c(max(hourly_rides_high$timestamp_hour), max(hourly_rides_low$timestamp_hour)))
+
+all_hours = data.frame(timestamp_hour = seq.POSIXt(from = start_time, to = end_time, by = "hour"))
+```
+
+```{r}
+# Step 4: Join hourly rides with the complete timestamp range
+hourly_rides_high = all_hours %>%
+  left_join(hourly_rides_high, by = "timestamp_hour") %>%
+  mutate(total_rides_high = ifelse(is.na(total_rides_high), 0, total_rides_high))
+
+hourly_rides_low = all_hours %>%
+  left_join(hourly_rides_low, by = "timestamp_hour") %>%
+  mutate(total_rides_low = ifelse(is.na(total_rides_low), 0, total_rides_low))
+```
+
+```{r}
+# Join high-demand and low-demand rides, and calculate the difference
+rides_difference = hourly_rides_high %>%
+  left_join(hourly_rides_low, by = "timestamp_hour") %>%
+  mutate(ride_difference = total_rides_high - total_rides_low)
+```
+
+```{r}
+# Line plot for ride difference over time
+ggplot(rides_difference, aes(x = timestamp_hour, y = ride_difference)) +
+  geom_line(color = "darksalmon") +
+  labs(
+    title = "Figure 11: Difference in High and Low Demand Stations",
+    x = "Timestamp (Hourly)",
+    y = "Ride Difference (High - Low)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+```
+From Figure 11 above we can see that there are typically more rides in low-demand stations as compared to high-demand stations. This might seem counter-intuitive at first, however, it is important to note that there are many more low-demand-stations than high-demand. There are still around 300 or so observations that fall in the positive range and there are few large spikes as well, which are essential to optimize vehicle redistribution.
+
+```{r}
+positive_ride_diff <- rides_difference %>%
+  filter(ride_difference > 0)
+```
+
+```{r}
+# Extract the hour from timestamp_hour
+positive_ride_diff <- positive_ride_diff %>%
+  mutate(hour = hour(timestamp_hour))
+
+# Count occurrences of each hour
+hourly_counts <- positive_ride_diff %>%
+  group_by(hour) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  arrange(desc(count))
+
+```
+```{r}
+# Figure 12: Positive Ride Differences Over Time
+plot_positive_diff <- ggplot(positive_ride_diff, aes(x = timestamp_hour, y = ride_difference)) +
+  geom_line(color = "forestgreen", size = 1) +
+  labs(
+    title = "Figure 12: Positive Ride Differences Over Time",
+    x = "Timestamp (Hourly)",
+    y = "Ride Difference (High - Low)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Figure 13: Most Common Hours with Positive Ride Differences
+plot_hourly_counts <- ggplot(hourly_counts, aes(x = factor(hour), y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Figure 13: Most Common Hours with Positive Ride Differences",
+    x = "Hour of the Day",
+    y = "Count of Positive Ride Differences"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Combine the two plots in a 2x1 layout
+combined_plot <- plot_positive_diff / plot_hourly_counts  # Use '/' to stack vertically
+
+# Display the combined plot
+combined_plot
+```
+
+From Figure 12 and 13 it is clear to see that there are imbalances in high-demand areas during the warmers months in the night time. We can infer that low-demand stations are popular for people to commute for school and work from largely locations in the city outskirts. The flow of rides seems to be balanced in that aspect, however, during warmers months in early mornings and late nights, demand for rides in the downtown areas pick-up despite the relative low "overall rides" during these times as we saw back in Figure 3. It makes sense as the lower overall activity in these times would not encourage a a proper redistribution of vehicles.
+
+As a side note, a time series forecasting model was trialed to fit both the values for high-demand stations and the differences between high-and-low using an ARIMA. We received some decent-enough results, however, the the plot of residuals in the ACF and PACF still indicated a lot of seasonality and cyclical elements that would have required significant tuning to generate more accurate forecasts - which at this point of time is out of the scope of our project. 
+
+## Classification
+
+Let's switch gears and understand what goes into the user preference of being a member rider against being a casual rider. To do this we will use a LASSO path logistic regression to predict whether a ride was a ridden by a member. We will use the vehicle type, our clusters of low, medium, and high demand stations, trip_duration, and month, day, and part of the day as our initial features. Again, due to computational limits, we will not use the entire set of 6 million observations, but use 80,000 for training and 20,000 for testing. The LASSO path will also help alleviate burden on the predictor aspect by performing feature selection.
+
+```{r}
+# Precompute station names for each cluster
+low_demand_stations = station_data_sample %>%
+  filter(cluster == 1) %>%
+  pull(start_station_name)
+
+medium_demand_stations = station_data_sample %>%
+  filter(cluster == 2) %>%
+  pull(start_station_name)
+
+high_demand_stations = station_data_sample %>%
+  filter(cluster == 3) %>%
+  pull(start_station_name)
+
+# Add cluster dummy variables and binary target variable
+lasso_data = df %>%
+  mutate(
+    member_casual_binary = ifelse(member_casual == "member", 1, 0),
+    cluster_low = ifelse(start_station_name %in% low_demand_stations, 1, 0),
+    cluster_medium = ifelse(start_station_name %in% medium_demand_stations, 1, 0),
+    cluster_high = ifelse(start_station_name %in% high_demand_stations, 1, 0)
+  ) %>%
+  select(rideable_type, trip_duration, month, day, part_of_day, 
+         cluster_low, cluster_medium, cluster_high, member_casual_binary)
+```
+
+```{r}
+set.seed(66)  # Reproducibility
+lasso_data_sampled = lasso_data %>%
+  sample_n(100000)
+
+# Split into 80% training and 20% testing sets
+train_index = createDataPartition(lasso_data_sampled$member_casual_binary, p = 0.8, list = FALSE)
+train_data = lasso_data_sampled[train_index, ]
+test_data = lasso_data_sampled[-train_index, ]
+
+# Convert day, month, and part_of_day to factors
+train_data = train_data %>%
+  mutate(
+    month = as.factor(month),
+    day = as.factor(day),
+    part_of_day = as.factor(part_of_day)
+  )
+
+test_data = test_data %>%
+  mutate(
+    month = as.factor(month),
+    day = as.factor(day),
+    part_of_day = as.factor(part_of_day)
+  )
+```
+
+```{r}
+# Function to create dummies for all levels of a factor
+create_dummies = function(df, column_name) {
+  levels = levels(df[[column_name]])
+  for (lvl in levels) {
+    new_col = paste0(column_name, "_", lvl)
+    df[[new_col]] = ifelse(df[[column_name]] == lvl, 1, 0)
+  }
+  df[[column_name]] = NULL  # Drop the original column
+  return(df)
+}
+
+# Apply the function to training and test data
+train_data = train_data %>%
+  create_dummies("month") %>%
+  create_dummies("day") %>%
+  create_dummies("part_of_day") %>%
+  create_dummies("rideable_type")
+
+test_data = test_data %>%
+  create_dummies("month") %>%
+  create_dummies("day") %>%
+  create_dummies("part_of_day") %>%
+  create_dummies("rideable_type")
+```
+
+```{r}
+# Select predictor columns (exclude target variable)
+predictor_columns = setdiff(colnames(train_data), "member_casual_binary")
+
+# Prepare x_train and x_test as matrices
+x_train = train_data %>%
+  select(all_of(predictor_columns)) %>%
+  as.matrix()
+
+x_test = test_data %>%
+  select(all_of(predictor_columns)) %>%
+  as.matrix()
+
+# Extract target variable
+y_train = train_data$member_casual_binary
+y_test = test_data$member_casual_binary
+```
+
+```{r}
+set.seed(66)  
+cv_lasso = cv.glmnet(x_train, y_train, family = "binomial", alpha = 1)
+
+# Plot cross-validated error
+plot(cv_lasso)
+title("Figure 14: Cross-Validation for Optimal Lambda")
+
+# Extract the optimal lambda
+optimal_lambda <- cv_lasso$lambda.min
+```
+
+Using cross-validation, we have extracted an optimal lambda that minimizes deviance. This value is around 0.00007. Let's use this best model to generate the predictions.
+
+```{r}
+# Predict probabilities on the test set using optimal lambda
+pred_probs = predict(cv_lasso, s = optimal_lambda, newx = x_test, type = "response")
+
+# Convert probabilities to binary predictions (threshold = 0.5)
+pred_classes = ifelse(pred_probs > 0.5, 1, 0)
+
+# Evaluate model performance
+conf_matrix = confusionMatrix(as.factor(pred_classes), as.factor(y_test))
+print(conf_matrix)
+```
+We get an overall accuracy of around 67% which is not bad. However, we get a recall for class 0 as 25.9% which is quite low, suggesting the model struggles to predict the "Casual" class correctly. This is not the end of the world however, as we get a recall for class 1 as 90.7%. This is very high meaning the model does well at predicting members which is our primary objective. The poor performance for the negative class could be partly due to the imbalance, with it consisting of 36% of the data. If we wanted the best model for accuracy it might have made sense to utilize something like a random forest or gradient boosting model or to tackle to imbalance with re-sampling methods. Our main objective however, is to understand what features go into being a member, so let's check some of these out.
+
+```{r}
+# Extract coefficients at optimal lambda
+coefficients = coef(cv_lasso, s = optimal_lambda)
+feature_importance <- data.frame(
+  feature = rownames(coefficients),
+  coefficient = as.numeric(coefficients)
+) %>%
+  filter(coefficient != 0) %>%
+  arrange(desc(abs(coefficient)))
+
+
+ggplot(feature_importance, aes(x = reorder(feature, abs(coefficient)), y = coefficient)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Figure 15: Feature Importance (LASSO Logistic Regression)",
+    x = "Feature",
+    y = "Coefficient"
+  ) +
+  theme_minimal()
+```
+We can see that some of the largest negative coefficients are rides with an electric scooter, or rides on the weekend. These areas are certainly areas of improvement to convert casual riders to members. It also makes sense that the largest positive coefficients relate to rides being taken in the winter months as members will be more dedicated. We can definitely takes these insights and make recommendations to Divvy on how to maximize member conversion.
+
+# Conclusion and Evaluation 
+
+Our analysis of the Divvy Bikeshare Program data uncovered significant patterns and actionable insights to optimize station placements, enhance bike availability, and understand the differences between member and casual riders.
+
+Optimizing Station Placements and Bike Availability:
+
+Clustering Analysis: We identified three demand clusters:
+-Cluster 1 (Low-Demand): Widespread, peripheral stations with lower activity.
+-Cluster 2 (Medium-Demand): Intermediary stations with moderate activity.
+-Cluster 3 (High-Demand): Downtown stations with concentrated and peak activity.
+
+Recommendations:
+-Improve bike availability at high-demand stations during early morning and late evening hours.
+-Introduce dynamic bike redistribution based on hourly demand forecasts.
+-Monitor and adjust for seasonal shifts in ride patterns, particularly during summer months.
+
+Member Retention and Engagement:
+
+LASSO Logistic Regression: The model, trained on 100,000 samples with features like rideable_type, trip duration, time-related factors (month, day, part_of_day), and station clusters, achieved:
+-Accuracy: ~67%
+-High Recall for Members: ~90.7%, indicating strong performance in identifying members.
+
+Recommendations:
+-Target casual riders using electric scooters and weekend trips with discounts or promotions for membership conversions.
+-Leverage the winter months as an opportunity to strengthen membership retention through targeted campaigns.
+-Promote high-demand stations with exclusive membership benefits like priority access or discounted fares.
+
+Strengths:
+-Robust Methodology: Our combination of clustering, time-series analysis, and logistic regression provided a comprehensive view of station-level demand and user behavior.
+-Feature Selection: LASSO logistic regression effectively selected meaningful predictors, reducing noise and ensuring interpretability.
+-Actionable Insights: Clear recommendations for bike availability optimization and membership engagement were derived from our results.
+
+Limitations:
+
+Model Simplifications:
+-Time-series forecasting was limited due to seasonal and cyclical complexities. The ARIMA model required significant tuning to improve residual behavior.
+The logistic regression achieved moderate accuracy but struggled with the imbalanced dataset, particularly for predicting casual riders.
+
+Data Constraints:
+-Our sampling (100,000 observations) was necessitated by computational limits. While representative, the full 6 million observations could provide additional insights.
+Unobserved factors, like weather conditions, user preferences, and special events, were not accounted for but could significantly influence ride patterns.
+
+Station-Level Assumptions:
+-Clustering was based solely on aggregated ride metrics. Real-world conditions like road access, infrastructure, or user density were not incorporated.
+
+
+
+
+
+
+
